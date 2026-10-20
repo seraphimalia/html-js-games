@@ -1,0 +1,1052 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Zombie Shooter</title>
+  <style>
+    /* STYLE = how the page looks (colours, sizes). */
+    body {
+      margin: 0;
+      background: #111;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      height: 100vh;
+      overflow: hidden;
+    }
+    canvas {
+      background: #2b2d42;
+      max-width: 100vw;
+      max-height: 100vh;
+      cursor: crosshair;
+    }
+  </style>
+</head>
+<body>
+
+<!-- The CANVAS is a blank drawing board. Our game draws everything on it. -->
+<canvas id="game" width="960" height="540"></canvas>
+
+<script>
+// =====================================================================
+//  ZOMBIE SHOOTER - by Tyrael
+//  Lines starting with // are COMMENTS. The computer ignores them.
+//  They're notes for humans, so we remember what each bit does.
+// =====================================================================
+
+// ---------- SETUP ----------
+const canvas = document.getElementById("game");
+const ctx = canvas.getContext("2d");   // ctx = our "paintbrush"
+
+const WORLD_WIDTH = 2400;   // the level is wider than the screen
+const GROUND_Y = 480;       // how far down the ground is
+const GRAVITY = 0.6;        // how hard things fall
+
+// ---------- THE PLAYER (our soldier) ----------
+// A "variable" is a labelled box that stores a value.
+// This one stores lots of info about the player.
+let player = {
+  x: 1200, y: 400,     // position
+  width: 30, height: 50,
+  speedX: 0, speedY: 0,
+  health: 100,
+  onGround: false,
+  hurtTimer: 0          // short "can't be hurt" time after a hit
+};
+
+// ---------- PLATFORMS (things you can stand on) ----------
+const platforms = [
+  { x: 300,  y: 380, width: 200, height: 20 },
+  { x: 800,  y: 320, width: 180, height: 20 },
+  { x: 1150, y: 360, width: 160, height: 20 },
+  { x: 1500, y: 300, width: 200, height: 20 },
+  { x: 1950, y: 370, width: 200, height: 20 }
+];
+
+// Lists that start empty and fill up as the game runs
+let bullets = [];
+let zombies = [];
+let splats = [];        // green zombie goo when you hit them
+
+// Game info
+let score = 0;
+let wave = 0;
+let zombiesLeftToSpawn = 0;
+let spawnTimer = 0;
+let waveBreakTimer = 0;   // pause between waves
+let gameOver = false;
+let shootCooldown = 0;
+let cameraX = 0;          // which part of the level we're looking at
+
+// ---------- WEAPONS ----------
+// Each weapon is a list of settings. Change these numbers to tweak the guns!
+//   cooldown = frames to wait between shots (smaller = faster)
+//   pellets  = bullets per shot
+//   spread   = how wobbly the aim is (0 = perfect)
+//   range    = how long bullets fly before vanishing
+//   unlockAt = total kills needed to get it
+const weapons = [
+  { name: "Pistol",  cooldown: 20, pellets: 1, spread: 0.02, range: 60, unlockAt: 0  },
+  { name: "M-16",    cooldown: 7,  pellets: 1, spread: 0.06, range: 70, unlockAt: 5  },
+  { name: "Shotgun", cooldown: 35, pellets: 6, spread: 0.35, range: 22, unlockAt: 10 },
+  { name: "Minigun", cooldown: 3,  pellets: 1, spread: 0.15, range: 60, unlockAt: 15 },
+  { name: "Grenade Launcher", cooldown: 30, pellets: 1, spread: 0, range: 0, unlockAt: 20, grenade: true }
+];
+
+// ---------- GRENADES ----------
+let grenades = [];            // grenades flying through the air
+let explosions = [];          // explosion flashes
+const BLAST_RADIUS = 90;      // how big the explosion is
+const SELF_DAMAGE = 10;       // how much your own grenades hurt you if you're too close
+let minigunSpin = 0;   // makes the minigun barrels look like they're spinning
+
+// ---------- POWER-UPS ----------
+// The different kinds of power-up. "letter" is drawn on the box.
+const powerUpTypes = [
+  { type: "health", colour: "#e63946", letter: "+", name: "+30 HEALTH" },
+  { type: "speed",  colour: "#ffd60a", letter: "S", name: "SPEED BOOST" },
+  { type: "damage", colour: "#fb8500", letter: "2x", name: "DOUBLE DAMAGE" },
+  { type: "shield", colour: "#4cc9f0", letter: "O", name: "SHIELD" }
+];
+const POWER_UP_TIME = 600;      // 600 frames = 10 seconds (the game runs at 60 frames a second)
+let powerUps = [];              // power-up boxes lying on the ground
+// How many frames each timed power-up has left (0 = not active)
+let powerTimers = { speed: 0, damage: 0, shield: 0 };
+let pickupText = { text: "", colour: "white", timer: 0 };
+
+function maybeDropPowerUp(z) {
+  const chance = z.big ? 0.5 : 0.15;     // 50% for big zombies, 15% for normal ones
+  if (Math.random() < chance) {
+    // Pick a random type from the list
+    const kind = powerUpTypes[Math.floor(Math.random() * powerUpTypes.length)];
+    powerUps.push({
+      x: z.x + z.width / 2 - 12, y: z.y,
+      width: 24, height: 24,
+      speedY: -5,                // pops up a little when dropped
+      kind: kind,
+      life: 600                  // disappears after 10 seconds
+    });
+  }
+}
+
+function collectPowerUp(p) {
+  if (p.kind.type === "health") {
+    player.health = Math.min(100, player.health + 30);   // never more than 100
+  } else {
+    powerTimers[p.kind.type] = POWER_UP_TIME;            // start (or restart) the timer
+  }
+  pickupText = { text: p.kind.name + "!", colour: p.kind.colour, timer: 90 };
+  sfxPickup();
+}
+
+// ---------- DRAWING THE GUNS ----------
+// Each gun is built from a few rectangles, like LEGO bricks.
+// fillRect(x, y, width, height):  x = along the gun (0 = shoulder, bigger = towards the end of the barrel)
+//                                 y = up/down (negative = top, positive = bottom)
+function drawGun(level) {
+  if (level === 0) {
+    // PISTOL - small and simple
+    ctx.fillStyle = "#9a9a9a"; ctx.fillRect(0, -4, 18, 6);    // slide (top part)
+    ctx.fillStyle = "#333";    ctx.fillRect(2, 2, 6, 9);      // handle
+  }
+  else if (level === 1) {
+    // M-16 - long black rifle
+    ctx.fillStyle = "#222";
+    ctx.fillRect(-12, -3, 12, 7);   // stock (rests on shoulder)
+    ctx.fillRect(0, -4, 24, 8);     // main body
+    ctx.fillRect(24, -2, 16, 3);    // thin barrel
+    ctx.fillRect(6, -8, 12, 3);     // carry handle on top
+    ctx.fillStyle = "#3a3a3a";
+    ctx.fillRect(11, 4, 6, 10);     // magazine (where the bullets go)
+  }
+  else if (level === 2) {
+    // SHOTGUN - wood and metal
+    ctx.fillStyle = "#8b5a2b";      // wood colour
+    ctx.fillRect(-14, -3, 16, 8);   // wooden stock
+    ctx.fillStyle = "#444";
+    ctx.fillRect(0, -4, 36, 5);     // long barrel
+    ctx.fillStyle = "#8b5a2b";
+    ctx.fillRect(14, 1, 14, 5);     // wooden pump (slides to reload)
+  }
+  else if (level === 3) {
+    // MINIGUN - big, heavy, three spinning barrels
+    ctx.fillStyle = "#556b2f"; ctx.fillRect(-6, 6, 12, 12);   // ammo box
+    ctx.fillStyle = "#444";    ctx.fillRect(0, -8, 18, 16);   // chunky body
+    ctx.fillStyle = "#333";    ctx.fillRect(6, 8, 5, 6);      // handle
+    // three barrels - the lighter one moves to show spinning
+    for (let i = 0; i < 3; i++) {
+      const lit = (Math.floor(minigunSpin) % 3) === i;
+      ctx.fillStyle = lit ? "#aaa" : "#666";
+      ctx.fillRect(18, -6 + i * 4, 26, 3);
+    }
+    ctx.fillStyle = "#333"; ctx.fillRect(38, -7, 3, 13);      // barrel clamp
+  }
+  else {
+    // GRENADE LAUNCHER - short, fat tube with a round drum
+    ctx.fillStyle = "#4b5320";  ctx.fillRect(-8, -3, 10, 7);    // stock
+    ctx.fillStyle = "#5c6b2e";  ctx.fillRect(0, -7, 34, 12);    // fat barrel
+    ctx.fillStyle = "#222";     ctx.fillRect(32, -6, 4, 10);    // barrel opening
+    ctx.fillStyle = "#3a4219";                                  // round ammo drum
+    ctx.beginPath(); ctx.arc(10, 7, 7, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = "#333";     ctx.fillRect(18, 5, 5, 8);      // handle
+  }
+}
+let weaponLevel = 0;       // 0 = Pistol, 1 = M-16, 2 = Shotgun, 3 = Minigun
+let totalKills = 0;        // adds up across every game (not reset when you die)
+let unlockMessageTimer = 0;
+
+function checkForNewWeapon() {
+  const next = weapons[weaponLevel + 1];
+  if (next && totalKills >= next.unlockAt) {
+    weaponLevel++;
+    unlockMessageTimer = 120;   // show "NEW WEAPON" for 2 seconds
+    sfxUnlock();
+  }
+}
+
+// ---------- KEYBOARD & MOUSE ----------
+// We remember which keys are held down right now.
+let keys = {};
+let mouse = { x: 0, y: 0, down: false };
+
+window.addEventListener("keydown", e => {
+  keys[e.key.toLowerCase()] = true;
+  if (e.key === " ") e.preventDefault();   // stop Space scrolling the page
+  if (gameOver && e.key.toLowerCase() === "r") restartGame();
+  if (e.key.toLowerCase() === "m") toggleMute();
+  startMusic();   // music starts on your first key press
+});
+window.addEventListener("keyup", e => { keys[e.key.toLowerCase()] = false; });
+
+canvas.addEventListener("mousemove", e => {
+  // Work out where the mouse is on the canvas (even if the page is stretched)
+  const box = canvas.getBoundingClientRect();
+  mouse.x = (e.clientX - box.left) * (canvas.width / box.width);
+  mouse.y = (e.clientY - box.top) * (canvas.height / box.height);
+});
+canvas.addEventListener("mousedown", () => { mouse.down = true; startMusic(); });
+window.addEventListener("mouseup", () => { mouse.down = false; });
+
+// ---------- WAVES ----------
+function startNextWave() {
+  wave = wave + 1;
+  zombiesLeftToSpawn = 3 + wave * 2;   // wave 1 = 5, wave 2 = 7, wave 3 = 9...
+  // Music speeds up 5 BPM every wave, but never faster than 170
+  currentBPM = Math.min(170, BPM + (wave - 1) * 5);
+  spawnTimer = 0;
+}
+
+function spawnZombie() {
+  // Zombies appear at the far left or far right edge of the level
+  const fromLeft = Math.random() < 0.5;
+  const isBig = wave >= 3 && Math.random() < 0.2;   // big zombies from wave 3
+
+  zombies.push({
+    x: fromLeft ? 0 : WORLD_WIDTH - 30,
+    y: GROUND_Y - 50,
+    width: isBig ? 45 : 30,
+    height: isBig ? 70 : 50,
+    speedY: 0,
+    speed: (0.8 + wave * 0.15 + Math.random() * 0.5) * (isBig ? 0.6 : 1),
+    health: isBig ? 8 : 3,
+    maxHealth: isBig ? 8 : 3,
+    big: isBig,
+    jumpCooldown: 0     // frames to wait before this zombie can jump again
+  });
+}
+
+// ---------- SHOOTING ----------
+function shoot() {
+  // Gun position (the soldier's shoulder)
+  const gunX = player.x + player.width / 2;
+  const gunY = player.y + 18;
+
+  // Where is the mouse in the WORLD (not just the screen)?
+  const targetX = mouse.x + cameraX;
+  const targetY = mouse.y;
+
+  // Maths to point the bullet at the mouse
+  const angle = Math.atan2(targetY - gunY, targetX - gunX);
+  const bulletSpeed = 14;
+  const weapon = weapons[weaponLevel];
+  sfxGun(weaponLevel);
+
+  // The grenade launcher fires a grenade instead of bullets
+  if (weapon.grenade) {
+    grenades.push({
+      x: gunX, y: gunY,
+      speedX: Math.cos(angle) * 10,
+      speedY: Math.sin(angle) * 10,
+      damage: powerTimers.damage > 0 ? 8 : 4,
+      life: 300
+    });
+    return;   // "return" = stop here, don't fire bullets too
+  }
+
+  // Fire one bullet per pellet (the shotgun fires 6!)
+  for (let i = 0; i < weapon.pellets; i++) {
+    // Add a random wobble to the aim based on the weapon's spread
+    const wobble = (Math.random() - 0.5) * weapon.spread * 2;
+    bullets.push({
+      x: gunX, y: gunY,
+      speedX: Math.cos(angle + wobble) * bulletSpeed,
+      speedY: Math.sin(angle + wobble) * bulletSpeed,
+      life: weapon.range,
+      damage: powerTimers.damage > 0 ? 2 : 1    // double damage power-up
+    });
+  }
+}
+
+// ---------- HELPER: are two boxes touching? ----------
+function touching(a, b) {
+  return a.x < b.x + b.width &&
+         a.x + a.width > b.x &&
+         a.y < b.y + b.height &&
+         a.y + a.height > b.y;
+}
+
+// ---------- HELPER: make things fall and land ----------
+function applyGravity(thing) {
+  thing.speedY += GRAVITY;
+  const oldBottom = thing.y + thing.height;
+  thing.y += thing.speedY;
+  thing.onGround = false;
+
+  // Land on the ground
+  if (thing.y + thing.height >= GROUND_Y) {
+    thing.y = GROUND_Y - thing.height;
+    thing.speedY = 0;
+    thing.onGround = true;
+  }
+
+  // Land on platforms (only when falling DOWN onto them)
+  for (const p of platforms) {
+    const overPlatform = thing.x + thing.width > p.x && thing.x < p.x + p.width;
+    if (overPlatform && thing.speedY >= 0 && oldBottom <= p.y && thing.y + thing.height >= p.y) {
+      thing.y = p.y - thing.height;
+      thing.speedY = 0;
+      thing.onGround = true;
+    }
+  }
+}
+
+// =====================================================================
+//  UPDATE - moves everything. Runs 60 times every second!
+// =====================================================================
+function update() {
+  if (gameOver) return;
+
+  // --- Player movement ---
+  player.speedX = 0;
+  // Speed boost makes you run faster and jump higher
+  const runSpeed = powerTimers.speed > 0 ? 8 : 5;
+  const jumpPower = powerTimers.speed > 0 ? 16 : 13;
+  if (keys["a"] || keys["arrowleft"])  player.speedX = -runSpeed;
+  if (keys["d"] || keys["arrowright"]) player.speedX = runSpeed;
+  if ((keys["w"] || keys[" "] || keys["arrowup"]) && player.onGround) {
+    player.speedY = -jumpPower;   // jump!
+    sfxJump();
+  }
+  player.x += player.speedX;
+  player.x = Math.max(0, Math.min(WORLD_WIDTH - player.width, player.x)); // stay in the level
+  applyGravity(player);
+  if (player.hurtTimer > 0) player.hurtTimer--;
+
+  // --- Shooting (hold mouse for auto-fire) ---
+  if (shootCooldown > 0) shootCooldown--;
+  if (mouse.down && shootCooldown === 0) {
+    shoot();
+    shootCooldown = weapons[weaponLevel].cooldown;
+  }
+  if (unlockMessageTimer > 0) unlockMessageTimer--;
+  if (mouse.down) minigunSpin += 0.5;   // barrels spin while shooting
+
+  // --- Move bullets ---
+  for (const b of bullets) {
+    b.x += b.speedX;
+    b.y += b.speedY;
+    b.life--;
+  }
+
+  // --- Move zombies towards the player ---
+  for (const z of zombies) {
+    if (z.x < player.x) z.x += z.speed;
+    else z.x -= z.speed;
+
+    // --- Zombie jumping ---
+    // Jump if: the player is higher up, the player is close, and the zombie is ready
+    if (z.jumpCooldown > 0) z.jumpCooldown--;
+    const playerIsAbove = player.y + player.height < z.y + z.height - 20;
+    const playerIsClose = Math.abs((player.x + player.width / 2) - (z.x + z.width / 2)) < 150;
+    if (z.onGround && playerIsAbove && playerIsClose && z.jumpCooldown === 0) {
+      if (Math.random() < 0.05) {        // a small random delay so they don't all jump together
+        z.speedY = -13;                  // same jump power as the player
+        z.jumpCooldown = 60;             // wait about 1 second before jumping again
+      }
+    }
+
+    applyGravity(z);
+
+    // Zombie bites the player!
+    // (the shield stops all bites!)
+    if (touching(z, player) && player.hurtTimer === 0 && powerTimers.shield === 0) {
+      player.health -= z.big ? 20 : 10;
+      player.hurtTimer = 45;
+      sfxHurt();
+      player.speedY = -6;   // little knock-up
+      if (player.health <= 0) {
+        player.health = 0;
+        gameOver = true;
+      }
+    }
+  }
+
+  // --- Did a bullet hit a zombie? ---
+  for (const b of bullets) {
+    for (const z of zombies) {
+      if (b.life > 0 && z.health > 0 &&
+          b.x > z.x && b.x < z.x + z.width &&
+          b.y > z.y && b.y < z.y + z.height) {
+        b.life = 0;   // bullet is used up
+        makeSplat(b.x, b.y);
+        damageZombie(z, b.damage);
+      }
+    }
+  }
+
+  // --- Grenades: fly in an arc, explode when they hit something ---
+  for (const g of grenades) {
+    g.x += g.speedX;
+    g.y += g.speedY;
+    g.speedY += 0.35;     // gravity pulls it down = curved flight
+    g.life--;
+
+    let hit = g.y >= GROUND_Y || g.x < 0 || g.x > WORLD_WIDTH || g.life <= 0;
+    for (const p of platforms) {
+      if (g.x > p.x && g.x < p.x + p.width && g.y > p.y && g.y < p.y + p.height) hit = true;
+    }
+    for (const z of zombies) {
+      if (z.health > 0 && g.x > z.x && g.x < z.x + z.width && g.y > z.y && g.y < z.y + z.height) hit = true;
+    }
+    if (hit) {
+      explode(g.x, g.y, g.damage);
+      g.life = 0;
+    }
+  }
+  grenades = grenades.filter(g => g.life > 0);
+
+  // Explosion flashes fade out
+  for (const e of explosions) e.timer--;
+  explosions = explosions.filter(e => e.timer > 0);
+
+  // Remove dead zombies and old bullets from the lists
+  zombies = zombies.filter(z => z.health > 0);
+  bullets = bullets.filter(b => b.life > 0);
+
+  // --- Splats fade away ---
+  for (const s of splats) {
+    s.x += s.speedX;
+    s.y += s.speedY;
+    s.speedY += 0.3;
+    s.life--;
+  }
+  splats = splats.filter(s => s.life > 0);
+
+  // --- Power-ups: fall, get picked up, or vanish ---
+  for (const p of powerUps) {
+    applyGravity(p);
+    p.life--;
+    if (touching(p, player)) {
+      collectPowerUp(p);
+      p.life = 0;     // remove it
+    }
+  }
+  powerUps = powerUps.filter(p => p.life > 0);
+
+  // Count down the power-up timers
+  if (powerTimers.speed > 0)  powerTimers.speed--;
+  if (powerTimers.damage > 0) powerTimers.damage--;
+  if (powerTimers.shield > 0) powerTimers.shield--;
+  if (pickupText.timer > 0)   pickupText.timer--;
+
+  // --- Wave control ---
+  if (zombiesLeftToSpawn > 0) {
+    spawnTimer--;
+    if (spawnTimer <= 0) {
+      spawnZombie();
+      zombiesLeftToSpawn--;
+      spawnTimer = Math.max(30, 90 - wave * 5);   // time between zombies
+    }
+  } else if (zombies.length === 0) {
+    // Wave cleared! Short break, then the next wave.
+    if (waveBreakTimer === 0) waveBreakTimer = 150;   // 2.5 seconds
+    waveBreakTimer--;
+    if (waveBreakTimer === 0) startNextWave();
+  }
+
+  // --- Camera follows the player ---
+  cameraX = player.x - canvas.width / 2;
+  cameraX = Math.max(0, Math.min(WORLD_WIDTH - canvas.width, cameraX));
+}
+
+// Hurts a zombie. If its health hits 0, it dies and you get the rewards.
+function damageZombie(z, amount) {
+  if (z.health <= 0) return;     // already dead
+  z.health -= amount;
+  if (z.health > 0) {
+    sfxZombieHit();
+  } else {
+    score += z.big ? 50 : 10;
+    totalKills++;
+    checkForNewWeapon();
+    maybeDropPowerUp(z);
+    sfxZombieDie();
+  }
+}
+
+// BOOM! Hurts every zombie inside the blast circle (and maybe you!)
+function explode(x, y, damage) {
+  explosions.push({ x: x, y: y, timer: 20 });
+  sfxExplosion();
+  for (let i = 0; i < 3; i++) makeSplat(x, y);
+
+  // Distance = how far apart two points are (using Pythagoras from maths class!)
+  for (const z of zombies) {
+    const dist = Math.hypot((z.x + z.width / 2) - x, (z.y + z.height / 2) - y);
+    if (dist < BLAST_RADIUS) damageZombie(z, damage);
+  }
+
+  // Too close to your own explosion? Ouch! (the shield protects you)
+  const playerDist = Math.hypot((player.x + player.width / 2) - x, (player.y + player.height / 2) - y);
+  if (playerDist < BLAST_RADIUS && powerTimers.shield === 0 && player.hurtTimer === 0) {
+    player.health -= SELF_DAMAGE;
+    player.hurtTimer = 45;
+    sfxHurt();
+    if (player.health <= 0) {
+      player.health = 0;
+      gameOver = true;
+    }
+  }
+}
+
+function makeSplat(x, y) {
+  for (let i = 0; i < 6; i++) {
+    splats.push({
+      x: x, y: y,
+      speedX: (Math.random() - 0.5) * 6,
+      speedY: (Math.random() - 0.8) * 5,
+      life: 30
+    });
+  }
+}
+
+// =====================================================================
+//  DRAW - paints everything on the screen. Also 60 times a second.
+// =====================================================================
+function draw() {
+  // Clear the screen (paint the sky)
+  ctx.fillStyle = "#2b2d42";
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  // Moon (doesn't move with the camera, so it feels far away)
+  ctx.fillStyle = "#f1f1d4";
+  ctx.beginPath();
+  ctx.arc(800, 90, 40, 0, Math.PI * 2);
+  ctx.fill();
+
+  // Everything below here moves with the camera
+  ctx.save();
+  ctx.translate(-cameraX, 0);
+
+  // Ground
+  ctx.fillStyle = "#3d2b1f";
+  ctx.fillRect(0, GROUND_Y, WORLD_WIDTH, canvas.height - GROUND_Y);
+  ctx.fillStyle = "#4a7c3a";
+  ctx.fillRect(0, GROUND_Y, WORLD_WIDTH, 8);
+
+  // Platforms
+  ctx.fillStyle = "#6b5b4b";
+  for (const p of platforms) ctx.fillRect(p.x, p.y, p.width, p.height);
+
+  // Power-up boxes (flash when about to disappear)
+  for (const p of powerUps) {
+    if (p.life > 180 || p.life % 20 < 10) {
+      ctx.fillStyle = p.kind.colour;
+      ctx.fillRect(p.x, p.y, p.width, p.height);
+      ctx.strokeStyle = "white";
+      ctx.lineWidth = 2;
+      ctx.strokeRect(p.x, p.y, p.width, p.height);
+      ctx.fillStyle = "black";
+      ctx.font = "bold 14px Arial";
+      ctx.textAlign = "center";
+      ctx.fillText(p.kind.letter, p.x + p.width / 2, p.y + 17);
+      ctx.textAlign = "left";
+    }
+  }
+
+  // Zombies
+  for (const z of zombies) {
+    ctx.fillStyle = z.big ? "#3f6b2a" : "#5fa83b";
+    ctx.fillRect(z.x, z.y, z.width, z.height);
+    // red eyes
+    ctx.fillStyle = "red";
+    const facingRight = z.x < player.x;
+    const eyeX = facingRight ? z.x + z.width - 10 : z.x + 4;
+    ctx.fillRect(eyeX, z.y + 10, 6, 6);
+    // health bar
+    ctx.fillStyle = "black";
+    ctx.fillRect(z.x, z.y - 8, z.width, 4);
+    ctx.fillStyle = "lime";
+    ctx.fillRect(z.x, z.y - 8, z.width * (z.health / z.maxHealth), 4);
+  }
+
+  // Player (flashes when hurt)
+  if (player.hurtTimer % 10 < 5) {
+    // body
+    ctx.fillStyle = "#4a6fa5";
+    ctx.fillRect(player.x, player.y + 14, player.width, player.height - 14);
+    // head
+    ctx.fillStyle = "#f2c9a0";
+    ctx.fillRect(player.x + 5, player.y, 20, 16);
+    // helmet
+    ctx.fillStyle = "#3b5323";
+    ctx.fillRect(player.x + 3, player.y - 3, 24, 7);
+
+    // gun (rotates to point at the mouse)
+    const gunX = player.x + player.width / 2;
+    const gunY = player.y + 18;
+    const angle = Math.atan2(mouse.y - gunY, mouse.x + cameraX - gunX);
+    ctx.save();
+    ctx.translate(gunX, gunY);
+    ctx.rotate(angle);
+    // If aiming left, flip the gun so it isn't upside down
+    if (Math.abs(angle) > Math.PI / 2) ctx.scale(1, -1);
+    drawGun(weaponLevel);
+    ctx.restore();
+  }
+
+  // Shield bubble around the player
+  if (powerTimers.shield > 0 && (powerTimers.shield > 120 || powerTimers.shield % 20 < 10)) {
+    ctx.strokeStyle = "#4cc9f0";
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.arc(player.x + player.width / 2, player.y + player.height / 2, 42, 0, Math.PI * 2);
+    ctx.stroke();
+  }
+
+  // Bullets (orange when you have double damage)
+  for (const b of bullets) {
+    ctx.fillStyle = b.damage > 1 ? "#fb8500" : "yellow";
+    ctx.fillRect(b.x - 3, b.y - 3, 6, 6);
+  }
+
+  // Grenades
+  for (const g of grenades) {
+    ctx.fillStyle = g.damage > 4 ? "#fb8500" : "#3a4219";
+    ctx.beginPath(); ctx.arc(g.x, g.y, 6, 0, Math.PI * 2); ctx.fill();
+  }
+
+  // Explosions - an orange circle that grows and fades
+  for (const e of explosions) {
+    const progress = 1 - e.timer / 20;           // goes from 0 to 1
+    ctx.globalAlpha = 1 - progress;              // see-through as it fades
+    ctx.fillStyle = "#ff9f1c";
+    ctx.beginPath(); ctx.arc(e.x, e.y, BLAST_RADIUS * (0.4 + progress * 0.6), 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = "#fff3b0";
+    ctx.beginPath(); ctx.arc(e.x, e.y, BLAST_RADIUS * 0.4 * (1 - progress), 0, Math.PI * 2); ctx.fill();
+    ctx.globalAlpha = 1;
+  }
+
+  // Splats
+  ctx.fillStyle = "#7fff00";
+  for (const s of splats) ctx.fillRect(s.x, s.y, 4, 4);
+
+  ctx.restore();   // stop moving with the camera
+
+  // ---------- HUD (the info on top of the screen) ----------
+  // Health bar
+  ctx.fillStyle = "black";
+  ctx.fillRect(20, 20, 204, 24);
+  ctx.fillStyle = player.health > 30 ? "#3cb043" : "#d62828";
+  ctx.fillRect(22, 22, player.health * 2, 20);
+  ctx.fillStyle = "white";
+  ctx.font = "16px Arial";
+  ctx.fillText("HEALTH", 28, 38);
+
+  ctx.font = "20px Arial";
+  ctx.fillText("Wave: " + wave, 260, 40);
+  ctx.fillText("Score: " + score, 380, 40);
+  ctx.fillText("Zombies: " + (zombies.length + zombiesLeftToSpawn), 520, 40);
+
+  // Music info (bottom right)
+  ctx.font = "14px Arial";
+  ctx.fillStyle = "#ccc";
+  ctx.textAlign = "right";
+  let musicText = "Click or press a key to start the sound";
+  if (musicStarted) musicText = musicMuted ? "Sound OFF (press M)" : "Sound ON (press M to mute)";
+  ctx.fillText(musicText, canvas.width - 15, canvas.height - 15);
+  ctx.textAlign = "left";
+  ctx.font = "20px Arial";
+  ctx.fillStyle = "white";
+
+  // Weapon info (second row)
+  ctx.fillStyle = "#ffd166";
+  const weaponText = "Weapon: " + weapons[weaponLevel].name;
+  ctx.fillText(weaponText, 20, 75);
+  const infoX = 20 + ctx.measureText(weaponText).width + 25;   // just after the weapon name
+  const nextWeapon = weapons[weaponLevel + 1];
+  ctx.fillStyle = "white";
+  ctx.font = "16px Arial";
+  if (nextWeapon) {
+    ctx.fillText(nextWeapon.name + " in " + (nextWeapon.unlockAt - totalKills) + " kills", infoX, 75);
+  } else {
+    ctx.fillText("All weapons unlocked!", infoX, 75);
+  }
+
+  // Active power-ups with seconds left (third row)
+  ctx.font = "bold 16px Arial";
+  let hudX = 20;
+  for (const kind of powerUpTypes) {
+    const timeLeft = powerTimers[kind.type];
+    if (timeLeft > 0) {
+      ctx.fillStyle = kind.colour;
+      const label = kind.name + " " + Math.ceil(timeLeft / 60) + "s";
+      ctx.fillText(label, hudX, 105);
+      hudX += ctx.measureText(label).width + 20;
+    }
+  }
+
+  // "You picked up..." message
+  if (pickupText.timer > 0) {
+    ctx.fillStyle = pickupText.colour;
+    ctx.font = "bold 32px Arial";
+    ctx.textAlign = "center";
+    ctx.fillText(pickupText.text, canvas.width / 2, 300);
+    ctx.textAlign = "left";
+  }
+  ctx.fillStyle = "white";
+
+  ctx.textAlign = "center";
+  // New weapon message
+  if (unlockMessageTimer > 0) {
+    ctx.fillStyle = "#ffd166";
+    ctx.font = "bold 40px Arial";
+    ctx.fillText("NEW WEAPON: " + weapons[weaponLevel].name + "!", canvas.width / 2, 140);
+    ctx.fillStyle = "white";
+  }
+  // Message between waves
+  if (waveBreakTimer > 0 && !gameOver) {
+    ctx.font = "bold 48px Arial";
+    ctx.fillText("Wave " + wave + " cleared!", canvas.width / 2, 200);
+    ctx.font = "24px Arial";
+    ctx.fillText("Get ready for wave " + (wave + 1) + "...", canvas.width / 2, 240);
+  }
+
+  // Game over screen
+  if (gameOver) {
+    ctx.fillStyle = "rgba(0, 0, 0, 0.7)";
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    ctx.fillStyle = "#d62828";
+    ctx.font = "bold 64px Arial";
+    ctx.fillText("GAME OVER", canvas.width / 2, 220);
+    ctx.fillStyle = "white";
+    ctx.font = "28px Arial";
+    ctx.fillText("You survived to wave " + wave + "  |  Score: " + score, canvas.width / 2, 280);
+    ctx.font = "22px Arial";
+    ctx.fillText("Press R to play again", canvas.width / 2, 330);
+  }
+  ctx.textAlign = "left";
+}
+
+// =====================================================================
+//  MUSIC - an original phonk beat, made completely from code!
+//  No music file needed: the browser's "Web Audio" sound maker
+//  builds every drum hit and note from scratch.
+// =====================================================================
+let audio = null;            // the browser's sound maker (made on first click)
+let musicVolume = null;      // master volume knob
+let musicStarted = false;
+let musicMuted = false;
+let nextStepTime = 0;
+let currentStep = 0;
+
+const BPM = 130;                         // beats per minute (song speed)
+const STEP_TIME = 60 / BPM / 4;          // time of one "step" (a quarter of a beat)
+let currentBPM = BPM;                    // goes up each wave so the music gets faster!
+
+// PATTERNS - each line is one bar, split into 16 steps.
+// 1 = play the sound on that step, 0 = silence. Change them to make your own beat!
+const kickPattern  = [1,0,0,1, 0,0,1,0, 0,0,1,0, 0,0,0,0];
+const clapPattern  = [0,0,0,0, 1,0,0,0, 0,0,0,0, 1,0,0,1];
+const hatPattern   = [1,0,1,0, 1,0,1,1, 1,0,1,0, 1,0,1,1];
+
+// COWBELL MELODY - numbers are notes (bigger = higher), null = no note.
+// 4 bars long, then it repeats.
+const cowbellMelody = [
+  [0,null,0,null, 3,null,0,null, 7,null,5,null, 3,null,0,null],
+  [0,null,0,3, null,5,null,3, 10,null,7,null, 5,null,3,null],
+  [0,null,0,null, 3,null,0,null, 7,null,8,null, 7,null,5,null],
+  [12,null,10,null, 7,null,5,null, 3,null,5,null, 3,null,null,null]
+];
+// The bass note for each of the 4 bars (0 = home note)
+const bassNotes = [0, 0, -4, -2];
+
+// Turns a note number into a frequency (how high the sound is, in Hertz)
+function noteToFreq(baseFreq, note) {
+  return baseFreq * Math.pow(2, note / 12);
+}
+
+// Makes a "noise" sound (like TV static) - used for claps and hi-hats
+function makeNoise(ac, length) {
+  const buffer = ac.createBuffer(1, ac.sampleRate * length, ac.sampleRate);
+  const data = buffer.getChannelData(0);
+  for (let i = 0; i < data.length; i++) data[i] = Math.random() * 2 - 1;
+  const source = ac.createBufferSource();
+  source.buffer = buffer;
+  return source;
+}
+
+// Makes sounds crunchy/distorted (the phonk 808 sound)
+function makeDistortion(ac, amount) {
+  const shaper = ac.createWaveShaper();
+  const curve = new Float32Array(256);
+  for (let i = 0; i < 256; i++) {
+    const x = i / 128 - 1;
+    curve[i] = Math.tanh(x * amount);
+  }
+  shaper.curve = curve;
+  return shaper;
+}
+
+// ----- THE INSTRUMENTS -----
+function playKick(ac, out, time) {
+  const osc = ac.createOscillator();
+  const vol = ac.createGain();
+  osc.frequency.setValueAtTime(150, time);
+  osc.frequency.exponentialRampToValueAtTime(40, time + 0.15);   // pitch drops = "BOOM"
+  vol.gain.setValueAtTime(1, time);
+  vol.gain.exponentialRampToValueAtTime(0.001, time + 0.35);
+  osc.connect(vol).connect(out);
+  osc.start(time); osc.stop(time + 0.4);
+}
+
+function playBass(ac, out, time, note) {
+  const osc = ac.createOscillator();
+  const vol = ac.createGain();
+  const crunch = makeDistortion(ac, 4);
+  const freq = noteToFreq(46.25, note);              // a really low F#
+  osc.frequency.setValueAtTime(freq * 1.5, time);
+  osc.frequency.exponentialRampToValueAtTime(freq, time + 0.06);   // little slide
+  vol.gain.setValueAtTime(0.35, time);
+  vol.gain.exponentialRampToValueAtTime(0.001, time + 0.6);
+  osc.connect(crunch).connect(vol).connect(out);
+  osc.start(time); osc.stop(time + 0.65);
+}
+
+function playClap(ac, out, time) {
+  const noise = makeNoise(ac, 0.2);
+  const filter = ac.createBiquadFilter();
+  filter.type = "bandpass"; filter.frequency.value = 1500;
+  const vol = ac.createGain();
+  vol.gain.setValueAtTime(0.5, time);
+  vol.gain.exponentialRampToValueAtTime(0.001, time + 0.15);
+  noise.connect(filter).connect(vol).connect(out);
+  noise.start(time); noise.stop(time + 0.2);
+}
+
+function playHat(ac, out, time) {
+  const noise = makeNoise(ac, 0.05);
+  const filter = ac.createBiquadFilter();
+  filter.type = "highpass"; filter.frequency.value = 7000;
+  const vol = ac.createGain();
+  vol.gain.setValueAtTime(0.15, time);
+  vol.gain.exponentialRampToValueAtTime(0.001, time + 0.04);
+  noise.connect(filter).connect(vol).connect(out);
+  noise.start(time); noise.stop(time + 0.05);
+}
+
+function playCowbell(ac, out, time, note) {
+  // A cowbell is two "square" waves mixed together, then filtered
+  const base = noteToFreq(587, note);
+  const filter = ac.createBiquadFilter();
+  filter.type = "bandpass"; filter.frequency.value = base * 1.5; filter.Q.value = 2;
+  const vol = ac.createGain();
+  vol.gain.setValueAtTime(0.25, time);
+  vol.gain.exponentialRampToValueAtTime(0.001, time + 0.18);
+  for (const ratio of [1, 1.48]) {
+    const osc = ac.createOscillator();
+    osc.type = "square";
+    osc.frequency.value = base * ratio;
+    osc.connect(filter);
+    osc.start(time); osc.stop(time + 0.2);
+  }
+  filter.connect(vol).connect(out);
+}
+
+// Plays everything that should happen on one step of the song
+function playStep(ac, out, step, time) {
+  const bar = Math.floor(step / 16) % 4;   // which of the 4 bars we're in
+  const s = step % 16;                     // which step in that bar
+  if (kickPattern[s]) { playKick(ac, out, time); playBass(ac, out, time, bassNotes[bar]); }
+  if (clapPattern[s]) playClap(ac, out, time);
+  if (hatPattern[s])  playHat(ac, out, time);
+  const note = cowbellMelody[bar][s];
+  if (note !== null) playCowbell(ac, out, time, note);
+}
+
+// The music "conductor": every 25 milliseconds it plans the next few notes
+function musicScheduler() {
+  while (nextStepTime < audio.currentTime + 0.1) {
+    playStep(audio, musicVolume, currentStep, nextStepTime);
+    nextStepTime += 60 / currentBPM / 4;   // time until the next step
+    currentStep++;
+  }
+}
+
+function startMusic() {
+  if (musicStarted) return;
+  musicStarted = true;
+  audio = new AudioContext();
+  // Volume knobs (0 = silent, 1 = full volume). Music and sound effects
+  // both go into the master knob, and the master goes to your speakers.
+  masterVolume = audio.createGain();
+  masterVolume.gain.value = 1;
+  masterVolume.connect(audio.destination);
+  musicVolume = audio.createGain();
+  musicVolume.gain.value = 0.4;
+  musicVolume.connect(masterVolume);
+  sfxVolume = audio.createGain();
+  sfxVolume.gain.value = 0.6;
+  sfxVolume.connect(masterVolume);
+  nextStepTime = audio.currentTime + 0.1;
+  setInterval(musicScheduler, 25);
+}
+
+function toggleMute() {
+  if (!musicStarted) return;
+  musicMuted = !musicMuted;                // ! means "the opposite of"
+  masterVolume.gain.value = musicMuted ? 0 : 1;   // mutes music AND sound effects
+}
+
+// =====================================================================
+//  SOUND EFFECTS - also made from code
+// =====================================================================
+let masterVolume = null;
+let sfxVolume = null;
+let lastGroanTime = 0;
+
+// A "beep" that slides from one pitch to another
+//   wave = "sine" (smooth), "square" (buzzy), "sawtooth" (harsh), "triangle" (soft)
+function tone(wave, startFreq, endFreq, length, volume, delay = 0) {
+  if (!audio) return;
+  const t = audio.currentTime + delay;
+  const osc = audio.createOscillator();
+  const vol = audio.createGain();
+  osc.type = wave;
+  osc.frequency.setValueAtTime(startFreq, t);
+  osc.frequency.exponentialRampToValueAtTime(endFreq, t + length);
+  vol.gain.setValueAtTime(volume, t);
+  vol.gain.exponentialRampToValueAtTime(0.001, t + length);
+  osc.connect(vol).connect(sfxVolume);
+  osc.start(t); osc.stop(t + length + 0.05);
+}
+
+// A "bang" or "shh" made from static noise
+//   filterType "lowpass" = deep and boomy, "highpass" = thin and sharp, "bandpass" = middle
+function noiseBurst(filterType, freq, length, volume) {
+  if (!audio) return;
+  const t = audio.currentTime;
+  const noise = makeNoise(audio, length + 0.05);
+  const filter = audio.createBiquadFilter();
+  filter.type = filterType; filter.frequency.value = freq;
+  const vol = audio.createGain();
+  vol.gain.setValueAtTime(volume, t);
+  vol.gain.exponentialRampToValueAtTime(0.001, t + length);
+  noise.connect(filter).connect(vol).connect(sfxVolume);
+  noise.start(t); noise.stop(t + length + 0.05);
+}
+
+function sfxGun(level) {
+  if (level === 0) {          // Pistol: sharp pop
+    noiseBurst("bandpass", 2500, 0.08, 0.6);
+    tone("square", 600, 150, 0.06, 0.15);
+  } else if (level === 1) {   // M-16: quick crack
+    noiseBurst("bandpass", 3000, 0.05, 0.45);
+    tone("square", 400, 120, 0.04, 0.1);
+  } else if (level === 2) {   // Shotgun: big BOOM
+    noiseBurst("lowpass", 1200, 0.3, 0.9);
+    tone("sine", 150, 40, 0.25, 0.6);
+  } else if (level === 3) {   // Minigun: tiny fast brrrt
+    noiseBurst("bandpass", 3500, 0.03, 0.3);
+  } else {                    // Grenade launcher: hollow "thunk"
+    tone("sine", 220, 80, 0.12, 0.5);
+    noiseBurst("lowpass", 800, 0.06, 0.3);
+  }
+}
+
+function sfxExplosion() {
+  noiseBurst("lowpass", 400, 0.7, 1.0);     // rumbling BOOM
+  tone("sine", 100, 30, 0.5, 0.7);          // deep thump
+}
+
+function sfxZombieHit() {
+  // Groan - but only one every 0.15 seconds, or the shotgun makes 6 at once!
+  if (!audio || audio.currentTime - lastGroanTime < 0.15) return;
+  lastGroanTime = audio.currentTime;
+  const pitch = 90 + Math.random() * 40;   // each groan sounds a bit different
+  tone("sawtooth", pitch, pitch * 0.6, 0.25, 0.2);
+}
+
+function sfxZombieDie() {
+  noiseBurst("lowpass", 600, 0.25, 0.7);   // squelchy splat
+  tone("sine", 200, 50, 0.2, 0.4);
+}
+
+function sfxHurt() {
+  tone("square", 400, 150, 0.2, 0.25);     // "ouch!"
+}
+
+function sfxJump() {
+  tone("sine", 300, 600, 0.1, 0.2);        // "boing"
+}
+
+function sfxPickup() {
+  // three quick notes going up = sparkle
+  tone("triangle", 660, 660, 0.1, 0.3, 0);
+  tone("triangle", 880, 880, 0.1, 0.3, 0.08);
+  tone("triangle", 1320, 1320, 0.15, 0.3, 0.16);
+}
+
+function sfxUnlock() {
+  // a little fanfare
+  const notes = [523, 659, 784, 1047];
+  notes.forEach((f, i) => tone("square", f, f, i === 3 ? 0.4 : 0.12, 0.15, i * 0.1));
+}
+
+// ---------- RESTART ----------
+function restartGame() {
+  player.x = 1200; player.y = 400;
+  player.speedY = 0; player.health = 100; player.hurtTimer = 0;
+  bullets = []; zombies = []; splats = []; powerUps = []; grenades = []; explosions = [];
+  powerTimers = { speed: 0, damage: 0, shield: 0 };
+  pickupText.timer = 0;
+  score = 0; wave = 0; waveBreakTimer = 0;
+  gameOver = false;
+  // Note: weaponLevel and totalKills are NOT reset, so you keep your best gun!
+  startNextWave();
+}
+
+// =====================================================================
+//  THE GAME LOOP - update, draw, repeat forever (about 60 times a second)
+// =====================================================================
+function gameLoop() {
+  update();
+  draw();
+  requestAnimationFrame(gameLoop);
+}
+
+startNextWave();
+gameLoop();
+</script>
+</body>
+</html>
